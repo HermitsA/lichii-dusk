@@ -28,8 +28,8 @@ Measured by the maintainer in actual play:
 | CPU | Intel Core i5-12400F |
 | GPU | NVIDIA GeForce RTX 3060 (12 GB), driver 616.56 |
 | RAM | 16 GB |
-| Average | **~40 fps** |
-| Peak | **~50 fps** |
+| Average | **~50 fps** |
+| Peak | **~60 fps** |
 | Heaviest area | **36+ fps** (13-16 fps before this fork's optimizations) |
 
 The emulator is mostly CPU-bound in this game, so a faster CPU helps more than a faster GPU.
@@ -125,8 +125,8 @@ Built on [zortos293/Lichii](https://github.com/zortos293/Lichii), [Frizti/Lichii
 | المعالج | Intel Core i5-12400F |
 | كرت الشاشة | NVIDIA GeForce RTX 3060 (12 GB)، تعريف 616.56 |
 | الذاكرة | 16 GB |
-| المتوسط | **حوالي 40 إطار/ثانية** |
-| الأعلى | **حوالي 50 إطار/ثانية** |
+| المتوسط | **حوالي 50 إطار/ثانية** |
+| الأعلى | **حوالي 60 إطار/ثانية** |
 | أثقل منطقة | **أكثر من 36 إطار/ثانية** (كانت 13-16 قبل تحسينات هذه النسخة) |
 
 المحاكي في هذه اللعبة يعتمد على المعالج أكثر من كرت الشاشة، لذلك يفيد المعالج الأسرع أكثر من كرت شاشة أقوى.
