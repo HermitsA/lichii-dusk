@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
 # Lichii for The Duskbloods (Network Test)
+
+> [!CAUTION]
+> The upstream Lichii project has no official download website. Its [compatibility site](https://lichii.zortos.me) is for reports only. Download this fork only from its [releases page](https://github.com/Mr-Tb/lichii-dusk/releases); other Lichii download sites are unaffiliated and may be unsafe.
 
 <p align="center"><b>Choose your language / اختر اللغة</b></p>
 
@@ -18,6 +20,8 @@
 It pairs with the [playDB-CNT](https://github.com/sikoGD/playDB-CNT) launcher by sikoGD, which provides the local network-test servers the game needs to get in-game.
 
 > Not affiliated with Nintendo, FromSoftware or the upstream projects. No games, keys or firmware are included. Use only files you have legally dumped yourself.
+
+Visit the [Lichii game compatibility website](https://lichii.zortos.me) to find games and compare community compatibility reports.
 
 ## Performance
 
@@ -35,6 +39,9 @@ Measured by the maintainer in actual play:
 The emulator is mostly CPU-bound in this game, so a faster CPU helps more than a faster GPU.
 
 ## What this fork changes
+
+Lichii uses its own profile: `%APPDATA%\lichii` on Windows, and the `lichii` directories under `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME` and `$XDG_CACHE_HOME` on Linux and macOS. Without XDG overrides, these are `~/.local/share/lichii`, `~/.config/lichii` and `~/.cache/lichii`. An existing portable `user/` directory still takes priority and is not imported or changed by the wizard.
+
 
 | Area | Fix |
 |---|---|
@@ -86,6 +93,8 @@ The first minutes stutter while shaders compile; this improves with each session
 | Window adapting filter | Bilinear | Cheapest |
 | Error applet | HLE | The LLE applet crashes the emulator |
 | Docked mode | On | |
+
+See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). The GUI build target is `lichii`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
 
 ## Troubleshooting
 

@@ -3,6 +3,8 @@
 
 #include "qt_common/util/game.h"
 
+#include <fmt/format.h>
+
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "core/file_sys/savedata_factory.h"
@@ -12,8 +14,12 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/shader_cache_v2/cache.h"
 
+#include <QBuffer>
 #include <QDesktopServices>
+#include <QFile>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QUrl>
 
@@ -136,7 +142,7 @@ bool CreateShortcutLink(const std::filesystem::path& shortcut_path, const std::s
 
 bool MakeShortcutIcoPath(const u64 program_id, const std::string_view game_file_name,
                          std::filesystem::path& out_icon_path) {
-    // Get path to Yuzu icons directory & icon extension
+    // Get path to Lichii icons directory & icon extension
     std::string ico_extension = "png";
 #if defined(_WIN32)
     out_icon_path = Common::FS::GetEdenPath(Common::FS::EdenPath::IconsDir);
@@ -243,25 +249,45 @@ void RemoveAddOnContent(u64 program_id, InstalledEntryType type) {
 void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
-    const auto target_file = [&] {
+    using VideoCommon::PipelineCacheClear;
+    const auto result = [&] {
         switch (target) {
         case GameListRemoveTarget::GlShaderCache:
-            return VideoCommon::VersionedPipelineCachePath(
-                shader_cache_folder_path, "opengl", VideoCommon::OpenGLPipelineCacheVersion);
-        case GameListRemoveTarget::VkShaderCache:
-            return VideoCommon::VersionedPipelineCachePath(
-                shader_cache_folder_path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
+            return VideoCommon::ClearPipelineCache(shader_cache_folder_path, "opengl",
+                                                   VideoCommon::PipelineCacheMagic, {},
+                                                   VideoCommon::OpenGLPipelineCacheVersion);
+        case GameListRemoveTarget::VkShaderCache: {
+            const auto log = shader_cache_folder_path / VideoCommon::ShaderCacheV2::FileName;
+            const bool had_log = Common::FS::Exists(log);
+            if (had_log && !Common::FS::RemoveFile(log)) {
+                return PipelineCacheClear::Failed;
+            }
+            // The older caches go too, or the next boot starts the log from them again. An empty
+            // one stays in its place when an even older one is on disk.
+            const auto cleared = VideoCommon::ClearPipelineCache(
+                shader_cache_folder_path, "vulkan", VideoCommon::PipelineCacheMagic,
+                VideoCommon::CompatibleVulkanPipelineCacheVersions,
+                VideoCommon::VulkanPipelineCacheVersion);
+            if (cleared == PipelineCacheClear::Cleared) {
+                // Its used list names pipelines that are no longer cached.
+                Common::FS::RemoveFile(VideoCommon::VersionedPipelineCachePath(
+                    shader_cache_folder_path, "vulkan_used",
+                    VideoCommon::VulkanPipelineCacheVersion));
+            }
+            return had_log && cleared == PipelineCacheClear::Missing ? PipelineCacheClear::Cleared
+                                                                     : cleared;
+        }
         default:
-            return std::filesystem::path{};
+            return PipelineCacheClear::Missing;
         }
     }();
 
-    if (!Common::FS::Exists(target_file)) {
+    if (result == PipelineCacheClear::Missing) {
         QtCommon::Frontend::Warning(tr("Error Removing Transferable Shader Cache"),
                                     tr("A shader cache for this title does not exist."));
         return;
     }
-    if (Common::FS::RemoveFile(target_file)) {
+    if (result == PipelineCacheClear::Cleared) {
         QtCommon::Frontend::Information(tr("Successfully Removed"),
                                         tr("Successfully removed the transferable shader cache."));
     } else {
@@ -273,13 +299,21 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
 void RemoveVulkanDriverPipelineCache(u64 program_id) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
-    const auto target_file = VideoCommon::VersionedPipelineCachePath(
-        shader_cache_folder_path, "vulkan_pipelines", VideoCommon::VulkanPipelineCacheVersion);
-
-    if (!Common::FS::Exists(target_file)) {
-        return;
+    // Shader cache v2's driver blobs
+    const auto binaries_file =
+        shader_cache_folder_path / VideoCommon::ShaderCacheV2::DriverFileName;
+    if (Common::FS::Exists(binaries_file) && !Common::FS::RemoveFile(binaries_file)) {
+        QtCommon::Frontend::Warning(tr("Error Removing Vulkan Driver Pipeline Cache"),
+                                    tr("Failed to remove the saved compiled shaders."));
     }
-    if (!Common::FS::RemoveFile(target_file)) {
+
+    // An empty cache stays in its place when an older one is on disk, so the next boot doesn't
+    // start from that one again.
+    if (VideoCommon::ClearPipelineCache(shader_cache_folder_path, "vulkan_pipelines",
+                                        VideoCommon::VulkanDriverPipelineCacheMagic,
+                                        VideoCommon::CompatibleVulkanPipelineCacheVersions,
+                                        VideoCommon::VulkanPipelineCacheVersion) ==
+        VideoCommon::PipelineCacheClear::Failed) {
         QtCommon::Frontend::Warning(tr("Error Removing Vulkan Driver Pipeline Cache"),
                                     tr("Failed to remove the driver pipeline cache."));
     }
@@ -646,6 +680,104 @@ bool SaveIconToFile(const std::filesystem::path& icon_path, const QImage& image)
 #else
     return false;
 #endif
+}
+
+std::filesystem::path CustomArtworkPath(u64 program_id) {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "artwork" /
+           fmt::format("{:016X}.png", program_id);
+}
+
+std::vector<u8> ReadCustomArtwork(u64 program_id) {
+    if (program_id == 0) {
+        return {};
+    }
+    constexpr qint64 MaxArtworkBytes = 16 * 1024 * 1024;
+    QFile file(QString::fromStdString(Common::FS::PathToUTF8String(CustomArtworkPath(program_id))));
+    if (!file.open(QIODevice::ReadOnly) || file.size() > MaxArtworkBytes) {
+        return {};
+    }
+    const QByteArray bytes = file.readAll();
+    return std::vector<u8>(bytes.begin(), bytes.end());
+}
+
+bool SaveCustomArtwork(u64 program_id, const QImage& image) {
+    if (program_id == 0 || image.isNull()) {
+        return false;
+    }
+    constexpr int MaxSide = 1024;
+    const QImage scaled =
+        std::max(image.width(), image.height()) > MaxSide
+            ? image.scaled(MaxSide, MaxSide, Qt::KeepAspectRatio, Qt::SmoothTransformation)
+            : image;
+    const auto path = CustomArtworkPath(program_id);
+    if (!Common::FS::CreateDirs(path.parent_path())) {
+        LOG_ERROR(Frontend, "Cannot create the custom artwork folder");
+        return false;
+    }
+    // Write to a temporary file and swap it in, so a failed save never leaves a broken image.
+    QSaveFile file(QString::fromStdString(Common::FS::PathToUTF8String(path)));
+    if (!file.open(QIODevice::WriteOnly) || !scaled.save(&file, "PNG") || !file.commit()) {
+        LOG_ERROR(Frontend, "Cannot write custom artwork for {:016X}", program_id);
+        return false;
+    }
+    return true;
+}
+
+// True when nothing is left at the path. A path that cannot be checked counts as still there.
+static bool RemoveCustomFile(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    const bool still_there = std::filesystem::exists(path, ec);
+    return !still_there && !ec;
+}
+
+bool RemoveCustomArtwork(u64 program_id) {
+    return RemoveCustomFile(CustomArtworkPath(program_id));
+}
+
+std::filesystem::path CustomTitlePath(u64 program_id) {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "names" /
+           fmt::format("{:016X}.txt", program_id);
+}
+
+// Larger name files are ignored when read, so a longer name is never saved.
+constexpr qint64 MaxCustomTitleBytes = 4096;
+
+std::string ReadCustomTitle(u64 program_id) {
+    if (program_id == 0) {
+        return {};
+    }
+    QFile file(QString::fromStdString(Common::FS::PathToUTF8String(CustomTitlePath(program_id))));
+    if (!file.open(QIODevice::ReadOnly) || file.size() > MaxCustomTitleBytes) {
+        return {};
+    }
+    return QString::fromUtf8(file.readAll()).simplified().toStdString();
+}
+
+bool SaveCustomTitle(u64 program_id, const std::string& title) {
+    if (program_id == 0) {
+        return false;
+    }
+    const QString name = QString::fromStdString(title).simplified();
+    const auto path = CustomTitlePath(program_id);
+    if (name.isEmpty()) {
+        return RemoveCustomFile(path);
+    }
+    const QByteArray bytes = name.toUtf8();
+    if (bytes.size() > MaxCustomTitleBytes) {
+        LOG_ERROR(Frontend, "The custom name for {:016X} is too long", program_id);
+        return false;
+    }
+    if (!Common::FS::CreateDirs(path.parent_path())) {
+        LOG_ERROR(Frontend, "Cannot create the custom name folder");
+        return false;
+    }
+    QSaveFile file(QString::fromStdString(Common::FS::PathToUTF8String(path)));
+    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) < 0 || !file.commit()) {
+        LOG_ERROR(Frontend, "Cannot write the custom name for {:016X}", program_id);
+        return false;
+    }
+    return true;
 }
 
 } // namespace QtCommon::Game

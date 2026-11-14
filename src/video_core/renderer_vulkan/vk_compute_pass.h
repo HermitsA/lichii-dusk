@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -162,6 +161,7 @@ public:
         /// layer_view(host level, layer).
         std::span<const u32> layers{};
         std::function<VkImageView(s32 host_level, u32 layer)> layer_view{};
+        u32 levels{~u32{0}};
     };
 
     /// Decodes `info`'s ASTC data in `map` into `target`. `skip` leading levels are absent on the

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -38,6 +37,8 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/string_util.h"
+#include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
 #include "core/internal_network/network_interface.h"
 #include "core/internal_network/sockets.h"
@@ -54,6 +55,7 @@ enum class CallType {
 
 /// Set while socket operations are cancelled, for waits that no host socket operation wakes.
 std::atomic_bool socket_operations_cancelled{false};
+std::atomic_bool direct_lan_active{false};
 
 #ifdef _WIN32
 
@@ -338,7 +340,11 @@ Errno GetAndLogLastError(CallType call_type = CallType::Other) {
     int e = errno;
 #endif
     const Errno err = TranslateNativeError(e, call_type);
-    if (err == Errno::AGAIN || err == Errno::TIMEDOUT || err == Errno::INPROGRESS) {
+    if (err == Errno::AGAIN) {
+        // A non-blocking call with nothing to do yet; games poll like this many times a second.
+        return err;
+    }
+    if (err == Errno::TIMEDOUT || err == Errno::INPROGRESS) {
         // These happen during normal operation, so only log them at debug level.
         LOG_DEBUG(Network, "Socket operation error: {}", Common::NativeErrorToString(e));
         return err;
@@ -817,6 +823,9 @@ std::optional<IPv4Address> GetHostIPv4Address() {
 }
 
 std::optional<IPv4Address> GetRoomIPv4Address() {
+    if (IsDirectLanActive()) {
+        return std::nullopt;
+    }
     if (const auto room_member = GetRoomMember().lock()) {
         // The room host and moderators are in the Moderator state instead of Joined
         const auto state = room_member->GetState();
@@ -825,6 +834,14 @@ std::optional<IPv4Address> GetRoomIPv4Address() {
         }
     }
     return std::nullopt;
+}
+
+bool IsDirectLanActive() {
+    return direct_lan_active;
+}
+
+void SetDirectLanActive(bool active) {
+    direct_lan_active = active;
 }
 
 std::string IPv4AddressToString(IPv4Address ip_addr) {
@@ -845,6 +862,9 @@ bool IsOnlineRedirectHost(const std::string& host) {
 std::variant<std::vector<AddrInfo>, GetAddrInfoError> GetAddressInfo(
     const std::string& host, const std::optional<std::string>& service) {
     const auto& redirect = OnlineRedirect::Get();
+    if (auto redirected = LocalRedirect::Resolve(host, service)) {
+        return std::move(*redirected);
+    }
     if (redirect.Matches(host)) {
         u16 port{};
         if (service) {
@@ -859,8 +879,26 @@ std::variant<std::vector<AddrInfo>, GetAddrInfoError> GetAddressInfo(
     }
     addrinfo hints{};
     hints.ai_family = AF_INET; // Switch only supports IPv4.
+    // Loopback only: no query reaches the host's resolver; only numeric addresses and localhost
+    // resolve, and the filter below keeps the loopback ones.
+    const bool loopback_only = redirect.loopback_only || LocalRedirect::LoopbackOnly();
+    std::string lookup = host;
+    if (loopback_only) {
+        hints.ai_flags = AI_NUMERICHOST;
+        std::string name = Common::ToLower(lookup);
+        while (name.ends_with('.')) {
+            name.pop_back();
+        }
+        if (name == "localhost") {
+            lookup = "127.0.0.1";
+        }
+    }
     addrinfo* addrinfo;
-    s32 gai_err = getaddrinfo(host.c_str(), service.has_value() ? service->c_str() : nullptr, &hints, &addrinfo);
+    s32 gai_err = getaddrinfo(lookup.c_str(), service.has_value() ? service->c_str() : nullptr, &hints, &addrinfo);
+    if (gai_err != 0 && loopback_only) {
+        LOG_DEBUG(Network, "Host redirect: lookup of {} blocked (loopback only)", host);
+        return GetAddrInfoError::NONAME;
+    }
     if (gai_err != 0) {
         return TranslateGetAddrInfoErrorFromNative(gai_err);
     }
@@ -882,10 +920,13 @@ std::variant<std::vector<AddrInfo>, GetAddrInfoError> GetAddressInfo(
         }
     }
     freeaddrinfo(addrinfo);
-    if (redirect.loopback_only) {
-        std::erase_if(ret, [](const AddrInfo& info) { return !OnlineRedirect::IsLoopback(info.addr); });
+    if (loopback_only) {
+        std::erase_if(ret, [&redirect](const AddrInfo& info) {
+            return (redirect.loopback_only && !OnlineRedirect::IsLoopback(info.addr)) ||
+                   !LocalRedirect::Allowed(info.addr);
+        });
         if (ret.empty()) {
-            LOG_INFO(Network, "Online redirect: blocked lookup of {} (loopback only)", host);
+            LOG_INFO(Network, "Host redirect: lookup of {} blocked (loopback only)", host);
             return GetAddrInfoError::NONAME;
         }
     }
@@ -955,6 +996,7 @@ Socket::~Socket() {
 
 Socket::Socket(Socket&& rhs) noexcept {
     fd = std::exchange(rhs.fd, INVALID_SOCKET);
+    socket_type = rhs.socket_type;
 }
 
 template <typename T>
@@ -984,6 +1026,7 @@ Errno Socket::SetSockOpt(SOCKET fd_so, int level, int option, T value) {
 Errno Socket::Initialize(Domain domain, Type type, Protocol protocol) {
     fd = socket(TranslateDomainToNative(domain), TranslateTypeToNative(type), TranslateProtocolToNative(protocol));
     if (fd != INVALID_SOCKET) {
+        socket_type = type;
         return Errno::SUCCESS;
     }
 
@@ -1024,22 +1067,36 @@ std::pair<SocketBase::AcceptResult, Errno> Socket::Accept() {
         .socket = std::make_unique<Socket>(new_socket),
         .sockaddr_in = TranslateToSockAddrIn(addr, addrlen),
     };
+    if (!LocalRedirect::Allowed(result.sockaddr_in)) {
+        const auto& peer = result.sockaddr_in;
+        LOG_DEBUG(Network, "Host redirect: connection from {}.{}.{}.{}:{} refused (loopback only)",
+                  peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3], peer.portno);
+        return {AcceptResult{}, Errno::CONNABORTED};
+    }
 
     return {std::move(result), Errno::SUCCESS};
 }
 
 Errno Socket::Connect(SockAddrIn addr_in) {
     const auto& redirect = OnlineRedirect::Get();
-    if (redirect.server && addr_in.ip == IPv4Address{127, 0, 0, 1} && addr_in.portno == 443) {
-        LOG_INFO(Network, "Online redirect: 127.0.0.1:443 -> {}.{}.{}.{}:{}", redirect.server->ip[0],
-                 redirect.server->ip[1], redirect.server->ip[2], redirect.server->ip[3],
-                 redirect.server->portno);
-        addr_in = *redirect.server;
+    if (!LocalRedirect::Allowed(addr_in)) {
+        LOG_DEBUG(Network, "Host redirect: connection to {}.{}.{}.{}:{} refused (loopback only)",
+                  addr_in.ip[0], addr_in.ip[1], addr_in.ip[2], addr_in.ip[3], addr_in.portno);
+        return Errno::CONNREFUSED;
     }
     if (redirect.loopback_only && !OnlineRedirect::IsLoopback(addr_in)) {
         LOG_INFO(Network, "Online redirect: refused connect to {}.{}.{}.{}:{} (loopback only)",
                  addr_in.ip[0], addr_in.ip[1], addr_in.ip[2], addr_in.ip[3], addr_in.portno);
         return Errno::CONNREFUSED;
+    }
+    if (socket_type == Type::STREAM) {
+        addr_in = LocalRedirect::ConnectTarget(addr_in);
+    }
+    if (redirect.server && addr_in.ip == IPv4Address{127, 0, 0, 1} && addr_in.portno == 443) {
+        LOG_INFO(Network, "Online redirect: 127.0.0.1:443 -> {}.{}.{}.{}:{}", redirect.server->ip[0],
+                 redirect.server->ip[1], redirect.server->ip[2], redirect.server->ip[3],
+                 redirect.server->portno);
+        addr_in = *redirect.server;
     }
     const sockaddr host_addr_in = TranslateFromSockAddrIn(addr_in);
     if (connect(fd, &host_addr_in, sizeof(host_addr_in)) != SOCKET_ERROR) {
@@ -1289,7 +1346,8 @@ std::pair<s32, Errno> Socket::SendTo(u32 flags, std::span<const u8> message,
     sockaddr host_addr_in;
 
     if (addr) {
-        if (OnlineRedirect::Get().loopback_only && !OnlineRedirect::IsLoopback(*addr)) {
+    if ((OnlineRedirect::Get().loopback_only && !OnlineRedirect::IsLoopback(*addr)) ||
+        !LocalRedirect::Allowed(*addr)) {
             return {-1, Errno::NETUNREACH};
         }
         host_addr_in = TranslateFromSockAddrIn(*addr);
